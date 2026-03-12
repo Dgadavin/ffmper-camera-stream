@@ -32,6 +32,7 @@ import time
 # ── constants ─────────────────────────────────────────────────────────────────
 
 HEARTBEAT_PORT      = 5010        # client sends UDP heartbeats here
+HEARTBEAT_INTERVAL  = 2           # client sends every N seconds
 HEARTBEAT_TIMEOUT   = 8           # server pauses stream after N seconds of silence
 HEARTBEAT_MAGIC     = b"ALIVE"
 
@@ -84,13 +85,13 @@ def build_ffmpeg_cmd(
 
     # Slow-network overrides: lower resolution, fps, bitrate, more keyframes
     if slow:
-        video_size  = "640x480"
-        keyframe_interval = framerate * 2    # keyframe every 2s — faster recovery after loss
+        video_size        = "640x480"
+        keyframe_interval = framerate * 2
     else:
-        video_size  = "1280x720"
-        keyframe_interval = framerate        # keyframe every 1s
+        video_size        = "1280x720"
+        keyframe_interval = framerate
 
-    if port2 is not None:
+    if port2:
         output_args = [
             "-map", "0:v",
             "-f", "tee",
@@ -104,17 +105,18 @@ def build_ffmpeg_cmd(
         "-loglevel", "warning",
         "-nostats",
 
-        # Input
+        # Always capture at 30fps — AVFoundation is picky about fractional rates.
+        # If a lower fps is requested, -r will drop frames after capture.
         "-f", "avfoundation",
-        "-framerate", str(framerate),
+        "-framerate", "30",
         "-video_size", video_size,
         "-probesize", "10M",
         "-i", av_input,
 
-        # Encode
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
+        "-r", str(framerate),        # output frame rate (drops frames if < 30)
         "-b:v", bitrate,
         "-maxrate", bitrate,
         "-bufsize", "500k",
@@ -176,8 +178,6 @@ class HeartbeatListener:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def kill_proc(proc):
-    if proc is None:
-        return
     try:
         proc.stdin.write(b"q\n")
         proc.stdin.flush()
