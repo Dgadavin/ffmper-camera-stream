@@ -28,6 +28,11 @@ brew install ffmpeg wireguard-tools
 sudo apt install ffmpeg wireguard
 ```
 
+**Client (macOS):**
+```bash
+brew install ffmpeg wireguard-tools
+```
+
 **Hub (EC2/VPS, Linux):**
 ```bash
 sudo apt install wireguard
@@ -220,6 +225,25 @@ Ports used:
 
 ---
 
+## Stats / delay measurement
+
+Add `--stats` to both sides to measure round-trip latency via the heartbeat channel:
+
+```bash
+python3 client.py --server-host 10.0.0.2 --stats
+python3 server.py --host 10.0.0.3 --stats
+```
+
+The client sends `PING:<timestamp_ms>` instead of `ALIVE` heartbeats. The server echoes back `PONG:<timestamp_ms>`. The client calculates RTT and prints stats every 5 seconds:
+
+```text
+[STATS] RTT: 42ms  avg: 38ms  min: 31ms  max: 55ms  (12 pings)
+```
+
+`--stats` on the client requires heartbeat (cannot combine with `--no-keepalive`).
+
+---
+
 ## Localhost test (no WireGuard)
 
 ```bash
@@ -248,6 +272,7 @@ python3 server.py --host 127.0.0.1 --no-keepalive
 | `--slow` | off | Slow-network mode (low res, low bitrate) |
 | `--no-keepalive` | off | Disable heartbeat listener |
 | `--heartbeat-port` | `5010` | Port to receive heartbeats on |
+| `--stats` | off | Enable PING/PONG RTT measurement via heartbeat |
 
 ### client.py
 
@@ -260,6 +285,7 @@ python3 server.py --host 127.0.0.1 --no-keepalive
 | `--slow` | off | Slow-network mode (larger jitter buffer) |
 | `--no-keepalive` | off | Disable heartbeat sender |
 | `--heartbeat-port` | `5010` | Port to send heartbeats to |
+| `--stats` | off | Enable RTT measurement via PING/PONG heartbeat |
 
 ### wg-setup.sh
 

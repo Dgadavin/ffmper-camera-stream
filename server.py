@@ -46,6 +46,7 @@ def check_ffmpeg():
         sys.exit(1)
 
 
+
 def list_devices():
     print("[*] Querying AVFoundation devices...\n")
     result = subprocess.run(
@@ -154,11 +155,17 @@ class HeartbeatListener:
     def _run(self):
         while not self._stop_event.is_set():
             try:
-                data, addr = self._sock.recvfrom(64)
+                data, addr = self._sock.recvfrom(128)
                 if data == HEARTBEAT_MAGIC:
                     if self.last_seen == 0:
                         print(f"[SERVER] Client connected from {addr[0]}")
                     self.last_seen = time.time()
+                elif data.startswith(b"PING:"):
+                    if self.last_seen == 0:
+                        print(f"[SERVER] Client connected from {addr[0]}")
+                    self.last_seen = time.time()
+                    # Echo timestamp back for RTT measurement
+                    self._sock.sendto(b"PONG:" + data[5:], addr)
             except socket.timeout:
                 continue
             except Exception:
@@ -214,6 +221,8 @@ def main():
                         help="Disable keep-alive (stream even if client is not responding)")
     parser.add_argument("--heartbeat-port", type=int, default=HEARTBEAT_PORT,
                         help=f"UDP port to receive client heartbeats on (default: {HEARTBEAT_PORT})")
+    parser.add_argument("--stats", action="store_true",
+                        help="Enable RTT measurement via heartbeat PING/PONG")
     args = parser.parse_args()
 
     check_ffmpeg()
@@ -240,6 +249,7 @@ def main():
     print(f"  Target     : udp://{args.host}:{args.port}" + (f" + :{args.port2}" if args.port2 else ""))
     print(f"  Bitrate    : {bitrate}   FPS: {fps}   Slow mode: {args.slow}")
     print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'enabled (port {args.heartbeat_port}, timeout {HEARTBEAT_TIMEOUT}s)'}")
+    print(f"  Stats      : {'enabled (PING/PONG)' if args.stats else 'off'}")
     print(f"  Press Ctrl+C to stop.")
     print("=" * 56)
     print()

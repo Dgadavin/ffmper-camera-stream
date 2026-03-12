@@ -43,26 +43,74 @@ class HeartbeatSender:
     """
     Sends a small UDP packet to the server every few seconds.
     Server uses this to know the client is alive and ready to receive.
+    In stats mode, sends PING:<timestamp_ms> and listens for PONG replies
+    to measure round-trip time.
     """
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, stats: bool = False):
         self.host        = host
         self.port        = port
+        self.stats       = stats
         self._sock       = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._thread     = None
         self._stop_event = threading.Event()
+        self._lock       = threading.Lock()
+        self.rtt_last    = None   # ms
+        self.rtt_min     = None
+        self.rtt_max     = None
+        self._rtt_sum    = 0.0
+        self._rtt_count  = 0
 
     def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        print(f"[CLIENT] Sending heartbeats to {self.host}:{self.port} every {HEARTBEAT_INTERVAL}s")
+        threading.Thread(target=self._send_run, daemon=True).start()
+        if self.stats:
+            self._sock.settimeout(1.0)
+            threading.Thread(target=self._recv_run, daemon=True).start()
+            threading.Thread(target=self._print_run, daemon=True).start()
+        mode = "PING/PONG (stats)" if self.stats else "ALIVE"
+        print(f"[CLIENT] Sending heartbeats ({mode}) to {self.host}:{self.port} every {HEARTBEAT_INTERVAL}s")
 
-    def _run(self):
+    def _send_run(self):
         while not self._stop_event.is_set():
             try:
-                self._sock.sendto(HEARTBEAT_MAGIC, (self.host, self.port))
+                if self.stats:
+                    ts = int(time.time() * 1000)
+                    self._sock.sendto(f"PING:{ts}".encode(), (self.host, self.port))
+                else:
+                    self._sock.sendto(HEARTBEAT_MAGIC, (self.host, self.port))
             except Exception:
                 pass
             self._stop_event.wait(HEARTBEAT_INTERVAL)
+
+    def _recv_run(self):
+        while not self._stop_event.is_set():
+            try:
+                data, _ = self._sock.recvfrom(128)
+                if data.startswith(b"PONG:"):
+                    sent_ts = int(data[5:])
+                    rtt = time.time() * 1000 - sent_ts
+                    with self._lock:
+                        self.rtt_last = rtt
+                        self._rtt_count += 1
+                        self._rtt_sum += rtt
+                        if self.rtt_min is None or rtt < self.rtt_min:
+                            self.rtt_min = rtt
+                        if self.rtt_max is None or rtt > self.rtt_max:
+                            self.rtt_max = rtt
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+    def _print_run(self):
+        while not self._stop_event.is_set():
+            self._stop_event.wait(5)
+            if self._stop_event.is_set():
+                break
+            with self._lock:
+                if self.rtt_last is not None:
+                    avg = self._rtt_sum / self._rtt_count
+                    print(f"[STATS] RTT: {self.rtt_last:.0f}ms  "
+                          f"avg: {avg:.0f}ms  min: {self.rtt_min:.0f}ms  "
+                          f"max: {self.rtt_max:.0f}ms  ({self._rtt_count} pings)")
 
     def stop(self):
         self._stop_event.set()
@@ -152,10 +200,16 @@ def main():
                         help="Server IP to send heartbeats to (default: 10.0.0.1). Use 127.0.0.1 for localhost test.")
     parser.add_argument("--heartbeat-port", type=int, default=HEARTBEAT_PORT,
                         help=f"UDP port to send heartbeats to (default: {HEARTBEAT_PORT})")
+    parser.add_argument("--stats", action="store_true",
+                        help="Enable RTT measurement via heartbeat PING/PONG (use with --stats on server)")
     args = parser.parse_args()
 
     if args.no_play and not args.save:
         print("[ERROR] --no-play requires --save (nothing to do otherwise).")
+        sys.exit(1)
+
+    if args.stats and args.no_keepalive:
+        print("[ERROR] --stats requires heartbeat (cannot use with --no-keepalive).")
         sys.exit(1)
 
     check_deps(play=not args.no_play)
@@ -169,6 +223,7 @@ def main():
     print(f"  Save to    : {args.save or 'no'}")
     print(f"  Slow mode  : {args.slow}")
     print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'sending to {args.server_host}:{args.heartbeat_port}'}")
+    print(f"  Stats      : {'enabled (RTT measurement)' if args.stats else 'off'}")
     if args.save and not args.no_play:
         print(f"  Save port  : {args.port + 1}  (server must use --port2 {args.port + 1})")
     print(f"  Waiting for server stream... (Ctrl+C to stop)")
@@ -178,7 +233,7 @@ def main():
     # ── start heartbeat ──
     heartbeat = None
     if not args.no_keepalive:
-        heartbeat = HeartbeatSender(args.server_host, args.heartbeat_port)
+        heartbeat = HeartbeatSender(args.server_host, args.heartbeat_port, stats=args.stats)
         heartbeat.start()
 
     # ── launch ffplay / ffmpeg ──
