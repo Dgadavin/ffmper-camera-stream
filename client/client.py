@@ -124,15 +124,16 @@ def ffplay_cmd(port: int, slow: bool) -> list:
 
     return [
         "ffplay",
-        "-loglevel",        "warning",
-        "-probesize",       "5M",
-        "-analyzeduration", "1000000",
+        "-loglevel",        "error",             # suppress PPS/SPS warnings during stream join
+        "-probesize",       "10M",
+        "-analyzeduration", "2000000",
         *extra,
+        "-fflags",          "+discardcorrupt",   # silently skip corrupt packets
         "-sync",            "ext",
         "-framedrop",                            # drop late frames instead of freezing
         "-max_delay",       "500000" if slow else "100000",   # µs
         "-window_title",    "Live Camera Stream",
-        f"udp://0.0.0.0:{port}",
+        f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000",
     ]
 
 

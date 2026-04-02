@@ -1,0 +1,3 @@
+# No pip dependencies.
+# Requires system packages: ffmpeg
+# Raspberry Pi also needs: rpicam-vid (or libcamera-vid)
