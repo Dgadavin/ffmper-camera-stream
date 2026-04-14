@@ -117,6 +117,7 @@ python3 server.py --host 127.0.0.1 --no-keepalive
 | `--heartbeat-port` | `5010` | Port to receive heartbeats on |
 | `--stats` | off | Enable PING/PONG RTT measurement |
 | `--sw` | off | Force software encoding (skip Pi hardware encoder) |
+| `--lossy` | off | Lossy-network mode: more frequent keyframes for faster error recovery (Starlink, LTE) |
 
 ---
 

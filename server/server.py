@@ -178,10 +178,20 @@ def detect_v4l2_format(device: str) -> str | None:
 
 # ── command builders ──────────────────────────────────────────────────────────
 
-def _resolve_video_params(slow: bool, framerate: int):
+def _resolve_video_params(slow: bool, framerate: int, lossy: bool = False):
     if slow:
         return "640x480", framerate * 2
+    if lossy:
+        # More frequent keyframes → faster recovery after packet loss
+        return "1280x720", max(framerate // 2, 1)
     return "1280x720", framerate
+
+
+def _udp_url(host: str, port: int) -> str:
+    """Build a UDP URL with small packet size for lower latency."""
+    # 7 × 188-byte TS packets = 1316 bytes — flushes to network sooner,
+    # fits inside any tunnel MTU, and avoids IP fragmentation
+    return f"udp://{host}:{port}?pkt_size=1316"
 
 
 def build_libcamera_cmds(
@@ -191,13 +201,14 @@ def build_libcamera_cmds(
     framerate: int,
     port2: int | None,
     slow: bool,
+    lossy: bool = False,
 ):
     """
     Build a (rpicam-vid command, ffmpeg command) pair.
     rpicam-vid captures + H.264 encodes on the Pi GPU, outputs to stdout.
     ffmpeg reads the raw H.264 from stdin and repackages as MPEG-TS over UDP.
     """
-    video_size, keyframe_interval = _resolve_video_params(slow, framerate)
+    video_size, keyframe_interval = _resolve_video_params(slow, framerate, lossy)
     width, height = video_size.split("x")
 
     # Convert bitrate string like "2000k" to bits/s for rpicam-vid
@@ -205,6 +216,8 @@ def build_libcamera_cmds(
 
     capture_cmd = [
         libcamera_bin(),
+        "--codec", "h264",          # H.264 encoding
+        "--libav-format", "mpegts", # MPEG-TS container with proper timestamps (Pi 5)
         "--width", width,
         "--height", height,
         "--framerate", str(framerate),
@@ -219,27 +232,29 @@ def build_libcamera_cmds(
         "--output", "-",      # stdout
     ]
 
+    url1 = _udp_url(host, port)
     if port2:
+        url2 = _udp_url(host, port2)
         output_args = [
             "-map", "0:v",
             "-f", "tee",
-            f"[f=mpegts]udp://{host}:{port}|[f=mpegts]udp://{host}:{port2}",
+            f"[f=mpegts]{url1}|[f=mpegts]{url2}",
         ]
     else:
-        output_args = ["-map", "0:v", "-f", "mpegts", f"udp://{host}:{port}"]
+        output_args = ["-map", "0:v", "-f", "mpegts", url1]
 
     ffmpeg_cmd = [
         "ffmpeg",
         "-loglevel", "warning",
         "-nostats",
-        "-fflags", "+genpts",
-        "-f", "h264",
-        "-framerate", str(framerate),
-        "-i", "pipe:0",      # read H.264 from stdin
+        "-f", "mpegts",
+        "-i", "pipe:0",      # read MPEG-TS from stdin (rpicam-vid outputs mpegts on Pi 5)
         "-c:v", "copy",      # no re-encode — already H.264 from the Pi GPU
         "-an",
         "-mpegts_flags", "+resend_headers",   # repeat PAT/PMT frequently
         "-muxrate", "0",                       # VBR — don't pad with nulls
+        "-muxdelay", "0",                      # no muxer buffering (default 0.7s!)
+        "-muxpreload", "0",
         "-flush_packets", "1",
         *output_args,
     ]
@@ -256,17 +271,20 @@ def build_ffmpeg_cmd(
     port2: int | None,
     slow: bool,
     hw_encode: bool,
+    lossy: bool = False,
 ) -> list:
-    video_size, keyframe_interval = _resolve_video_params(slow, framerate)
+    video_size, keyframe_interval = _resolve_video_params(slow, framerate, lossy)
 
+    url1 = _udp_url(host, port)
     if port2:
+        url2 = _udp_url(host, port2)
         output_args = [
             "-map", "0:v",
             "-f", "tee",
-            f"[f=mpegts]udp://{host}:{port}|[f=mpegts]udp://{host}:{port2}",
+            f"[f=mpegts]{url1}|[f=mpegts]{url2}",
         ]
     else:
-        output_args = ["-map", "0:v", "-f", "mpegts", f"udp://{host}:{port}"]
+        output_args = ["-map", "0:v", "-f", "mpegts", url1]
 
     # ── platform-specific input ──
     if IS_MACOS:
@@ -319,6 +337,9 @@ def build_ffmpeg_cmd(
         *encode_args,
         "-r", str(framerate),
         "-an",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+        "-flush_packets", "1",
         *output_args,
     ]
 
@@ -419,6 +440,8 @@ def main():
                         help="Enable RTT measurement via heartbeat PING/PONG")
     parser.add_argument("--sw", action="store_true",
                         help="Force software encoding (libx264) even when hardware is available")
+    parser.add_argument("--lossy", action="store_true",
+                        help="Lossy-network mode (Starlink, LTE): smaller UDP packets to avoid fragmentation, more frequent keyframes for faster error recovery")
     args = parser.parse_args()
 
     check_ffmpeg()
@@ -460,6 +483,7 @@ def main():
     print(f"  Target     : udp://{args.host}:{args.port}" + (f" + :{args.port2}" if args.port2 else ""))
     print(f"  Bitrate    : {bitrate}   FPS: {fps}   Slow mode: {args.slow}")
     print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'enabled (port {args.heartbeat_port}, timeout {HEARTBEAT_TIMEOUT}s)'}")
+    print(f"  Lossy mode : {'ON (small pkts + frequent keyframes)' if args.lossy else 'off'}")
     print(f"  Stats      : {'enabled (PING/PONG)' if args.stats else 'off'}")
     print(f"  Press Ctrl+C to stop.")
     print("=" * 56)
@@ -483,14 +507,14 @@ def main():
         nonlocal capture_proc, proc
         if use_libcamera:
             cap_cmd, ff_cmd = build_libcamera_cmds(
-                args.host, args.port, bitrate, fps, args.port2, args.slow,
+                args.host, args.port, bitrate, fps, args.port2, args.slow, args.lossy,
             )
             capture_proc = subprocess.Popen(cap_cmd, stdout=subprocess.PIPE)
             proc = subprocess.Popen(ff_cmd, stdin=capture_proc.stdout, stdout=subprocess.PIPE)
             capture_proc.stdout.close()  # allow SIGPIPE if ffmpeg exits
         else:
             hw = not args.sw and has_hw_encoder() if IS_LINUX else False
-            cmd = build_ffmpeg_cmd(device, args.host, args.port, bitrate, fps, args.port2, args.slow, hw)
+            cmd = build_ffmpeg_cmd(device, args.host, args.port, bitrate, fps, args.port2, args.slow, hw, args.lossy)
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def _stop_stream():

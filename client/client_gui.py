@@ -97,8 +97,8 @@ class StreamClient:
                 "-fflags", "+discardcorrupt+nobuffer",
                 "-flags", "low_delay",
                 "-max_delay", max_delay,
-                "-probesize", "10M",
-                "-analyzeduration", "2000000",
+                "-probesize", "512k",
+                "-analyzeduration", "500000",
                 "-i", f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000",
                 "-vf", f"scale={FRAME_W}:{FRAME_H}",
                 "-f", "rawvideo",
@@ -428,6 +428,16 @@ class MainWindow(QMainWindow):
         self._disconnect_btn.clicked.connect(self._disconnect)
         self._disconnect_btn.hide()
         sb_layout.addWidget(self._disconnect_btn)
+
+        self._exit_btn = QPushButton("Exit")
+        self._exit_btn.setFont(QFont("Helvetica", 11, QFont.Weight.Bold))
+        self._exit_btn.setFixedHeight(32)
+        self._exit_btn.setStyleSheet("""
+            QPushButton { background-color: #555; color: white; border-radius: 4px; padding: 0 16px; }
+            QPushButton:hover { background-color: #666; }
+        """)
+        self._exit_btn.clicked.connect(self.close)
+        sb_layout.addWidget(self._exit_btn)
 
         right_layout.addWidget(status_bar)
         main_layout.addWidget(right)
