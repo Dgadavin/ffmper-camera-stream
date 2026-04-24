@@ -131,9 +131,11 @@ def ffplay_cmd(port: int, slow: bool) -> list:
         "-fflags",          "+discardcorrupt",   # silently skip corrupt packets
         "-sync",            "ext",
         "-framedrop",                            # drop late frames instead of freezing
-        "-max_delay",       "500000" if slow else "100000",   # µs
+        "-max_delay",       "500000" if slow else "300000",   # µs — 300ms absorbs Starlink/mobile jitter
         "-window_title",    "Live Camera Stream",
-        f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000",
+        # buffer_size raises the kernel SO_RCVBUF (default ~200KB on macOS) so Starlink
+        # handoff bursts don't overflow the socket. fifo_size is ffmpeg's internal ring.
+        f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000&buffer_size=65536000",
     ]
 
 

@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -65,6 +66,7 @@ class StreamClient:
         self._heartbeat = None
         self._proc = None
         self._running = False
+        self._lock = threading.Lock()
 
     @property
     def running(self):
@@ -74,32 +76,47 @@ class StreamClient:
     def heartbeat(self):
         return self._heartbeat
 
-    def start(self, host, port, slow, keepalive, stats):
+    def start(self, host, port, slow, keepalive, stats, lossy=False, srt=False):
         self._running = True
         threading.Thread(
-            target=self._run, args=(host, port, slow, keepalive, stats), daemon=True,
+            target=self._run, args=(host, port, slow, keepalive, stats, lossy, srt), daemon=True,
         ).start()
 
-    def _run(self, host, port, slow, keepalive, stats):
+    def _run(self, host, port, slow, keepalive, stats, lossy, srt):
         try:
-            if keepalive:
-                self._heartbeat = HeartbeatSender(host, HEARTBEAT_PORT, stats=stats)
-                self._heartbeat.start()
-
             self.on_status("Connecting...")
 
-            max_delay = "500000" if slow else "100000"
+            # 300ms absorbs normal internet jitter; 500ms covers Starlink handoffs
+            # and other lossy/slow links.
+            max_delay = "500000" if (slow or lossy) else "300000"
 
-            # ffmpeg: read UDP MPEG-TS → decode → scale → output raw RGB24 to stdout
+            if srt:
+                # SRT listener: server connects in as caller. Retransmission happens
+                # inside the latency window, so the stream that reaches the decoder
+                # is effectively lossless. SRT negotiates the higher of the two ends'
+                # latencies, so 500ms here pairs with the server's default of 500ms
+                # (bump the server's --srt-latency if this isn't enough for Starlink).
+                input_url = f"srt://0.0.0.0:{port}?mode=listener&latency=500000"
+            else:
+                # UDP: fifo_size is ffmpeg's ring buffer; buffer_size is the kernel
+                # socket buffer (default ~200KB on macOS) so bursts don't overflow.
+                input_url = f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000&buffer_size=65536000"
+
+            # ffmpeg: read MPEG-TS from the wire → decode → scale → raw RGB24 on stdout
             cmd = [
                 "ffmpeg",
                 "-loglevel", "error",
                 "-fflags", "+discardcorrupt+nobuffer",
                 "-flags", "low_delay",
+                "-err_detect", "ignore_err",
+                "-max_error_rate", "1.0",
                 "-max_delay", max_delay,
-                "-probesize", "512k",
-                "-analyzeduration", "500000",
-                "-i", f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000",
+                # Larger probe window means the demuxer waits for a full GOP
+                # (SPS+PPS+IDR) before emitting the first frame, avoiding the
+                # "non-existing PPS 0 referenced" storm when joining mid-stream.
+                "-probesize", "5M",
+                "-analyzeduration", "2000000",
+                "-i", input_url,
                 "-vf", f"scale={FRAME_W}:{FRAME_H}",
                 "-f", "rawvideo",
                 "-pix_fmt", "rgb24",
@@ -107,7 +124,17 @@ class StreamClient:
                 "pipe:1",
             ]
 
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None)
+
+            # Heartbeat has to go out AFTER the listener is bound — otherwise
+            # the server's SRT caller races ahead and hits "Input/output error"
+            # trying to connect to a port that isn't listening yet. SRT takes
+            # longer than UDP to bind, so give it a second.
+            if srt:
+                time.sleep(1.0)
+            if keepalive:
+                self._heartbeat = HeartbeatSender(host, HEARTBEAT_PORT, stats=stats)
+                self._heartbeat.start()
 
             self.on_status("Streaming...")
 
@@ -126,24 +153,42 @@ class StreamClient:
             self.on_stopped()
 
     def stop(self):
+        # Signal the run loop to exit. Killing the subprocess EOFs its pipe,
+        # which unblocks the read() in _run so its finally block can run cleanup.
+        # We deliberately do NOT call _cleanup here — the reader thread owns it,
+        # and closing stdout from a second thread while the reader is blocked
+        # inside read() can hang on macOS.
         self._running = False
-        self._cleanup()
+        with self._lock:
+            proc = self._proc
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _cleanup(self):
-        if self._proc:
+        with self._lock:
+            proc, self._proc = self._proc, None
+            heartbeat, self._heartbeat = self._heartbeat, None
+        if proc:
             try:
-                self._proc.stdout.close()
+                proc.kill()
             except Exception:
                 pass
             try:
-                self._proc.kill()
-                self._proc.wait(timeout=3)
+                proc.wait(timeout=3)
             except Exception:
                 pass
-            self._proc = None
-        if self._heartbeat:
-            self._heartbeat.stop()
-            self._heartbeat = None
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        if heartbeat:
+            try:
+                heartbeat.stop()
+            except Exception:
+                pass
 
 
 # ── Video display widget ─────────────────────────────────────────────────────
@@ -215,7 +260,7 @@ class DeviceDialog(QDialog):
     def __init__(self, parent=None, device=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Device" if device else "Add Device")
-        self.setFixedSize(360, 420)
+        self.setFixedSize(360, 500)
         self.result = None
 
         layout = QVBoxLayout(self)
@@ -252,6 +297,25 @@ class DeviceDialog(QDialog):
         self.slow_cb = QCheckBox("Slow network mode")
         self.slow_cb.setChecked(device.get("slow", False) if device else False)
         layout.addWidget(self.slow_cb)
+
+        self.lossy_cb = QCheckBox("Lossy network (Starlink / LTE)")
+        self.lossy_cb.setToolTip(
+            "Enlarges the jitter buffer to absorb packet-loss bursts.\n"
+            "For full effect the server must also be run with --lossy."
+        )
+        self.lossy_cb.setChecked(device.get("lossy", False) if device else False)
+        layout.addWidget(self.lossy_cb)
+
+        self.srt_cb = QCheckBox("Use SRT (reliable transport)")
+        self.srt_cb.setToolTip(
+            "Transport over SRT instead of raw UDP. SRT retransmits lost\n"
+            "packets within a ~200ms latency budget — the stream reaching\n"
+            "the decoder is effectively lossless.\n\n"
+            "Server must also be started with --srt.\n"
+            "Requires ffmpeg built with libsrt on both ends."
+        )
+        self.srt_cb.setChecked(device.get("srt", False) if device else False)
+        layout.addWidget(self.srt_cb)
 
         self.stats_cb = QCheckBox("Show RTT stats")
         self.stats_cb.setChecked(device.get("stats", False) if device else False)
@@ -297,6 +361,8 @@ class DeviceDialog(QDialog):
             "port": port,
             "keepalive": self.keepalive_cb.isChecked(),
             "slow": self.slow_cb.isChecked(),
+            "lossy": self.lossy_cb.isChecked(),
+            "srt": self.srt_cb.isChecked(),
             "stats": self.stats_cb.isChecked(),
         }
         self.accept()
@@ -509,7 +575,8 @@ class MainWindow(QMainWindow):
         self._video.clear_frame()
 
         self._client.start(dev["host"], dev["port"], dev.get("slow", False),
-                           dev.get("keepalive", True), dev.get("stats", False))
+                           dev.get("keepalive", True), dev.get("stats", False),
+                           dev.get("lossy", False), dev.get("srt", False))
 
         if dev.get("stats") and dev.get("keepalive"):
             self._stats_timer.start(2000)

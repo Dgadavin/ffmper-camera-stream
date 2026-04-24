@@ -83,6 +83,19 @@ def has_hw_encoder() -> bool:
     return "h264_v4l2m2m" in result.stdout
 
 
+def has_srt_support() -> bool:
+    """Check if ffmpeg was built with libsrt."""
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-protocols"],
+        capture_output=True, text=True
+    )
+    # Filter output to avoid matching srtp (Secure RTP) lines.
+    for line in result.stdout.splitlines():
+        if line.strip() == "srt":
+            return True
+    return False
+
+
 def is_v4l2_capture_capable(device: str) -> bool:
     """Check if a V4L2 device supports video capture (not just metadata)."""
     result = subprocess.run(
@@ -179,16 +192,30 @@ def detect_v4l2_format(device: str) -> str | None:
 # ── command builders ──────────────────────────────────────────────────────────
 
 def _resolve_video_params(slow: bool, framerate: int, lossy: bool = False):
-    if slow:
-        return "640x480", framerate * 2
+    # Lossy always pulls keyframe interval down so Starlink/LTE can recover
+    # within ~0.5s, independent of resolution. Slow picks resolution; the
+    # two flags are orthogonal.
+    resolution = "640x480" if slow else "1280x720"
     if lossy:
-        # More frequent keyframes → faster recovery after packet loss
-        return "1280x720", max(framerate // 2, 1)
-    return "1280x720", framerate
+        keyframe_interval = max(framerate // 2, 1)     # ~0.5s
+    elif slow:
+        keyframe_interval = framerate * 2              # ~2s — saves bitrate
+    else:
+        keyframe_interval = framerate                  # ~1s
+    return resolution, keyframe_interval
 
 
-def _udp_url(host: str, port: int) -> str:
-    """Build a UDP URL with small packet size for lower latency."""
+def _stream_url(host: str, port: int, srt: bool = False, srt_latency_ms: int = 500) -> str:
+    """Build destination URL. UDP is fire-and-forget; SRT adds retransmission
+    on a configurable latency budget (great for Starlink/LTE).
+
+    500ms covers Starlink satellite-handoff gaps; raise to 1000ms if you still
+    see "Invalid level prefix" decoder errors."""
+    if srt:
+        # mode=caller → server initiates connection to the client's listener.
+        # latency is in microseconds — window of retransmission tolerance.
+        latency_us = srt_latency_ms * 1000
+        return f"srt://{host}:{port}?mode=caller&latency={latency_us}&pkt_size=1316"
     # 7 × 188-byte TS packets = 1316 bytes — flushes to network sooner,
     # fits inside any tunnel MTU, and avoids IP fragmentation
     return f"udp://{host}:{port}?pkt_size=1316"
@@ -202,6 +229,8 @@ def build_libcamera_cmds(
     port2: int | None,
     slow: bool,
     lossy: bool = False,
+    srt: bool = False,
+    srt_latency_ms: int = 500,
 ):
     """
     Build a (rpicam-vid command, ffmpeg command) pair.
@@ -232,9 +261,9 @@ def build_libcamera_cmds(
         "--output", "-",      # stdout
     ]
 
-    url1 = _udp_url(host, port)
+    url1 = _stream_url(host, port, srt=srt, srt_latency_ms=srt_latency_ms)
     if port2:
-        url2 = _udp_url(host, port2)
+        url2 = _stream_url(host, port2, srt=srt, srt_latency_ms=srt_latency_ms)
         output_args = [
             "-map", "0:v",
             "-f", "tee",
@@ -250,6 +279,10 @@ def build_libcamera_cmds(
         "-f", "mpegts",
         "-i", "pipe:0",      # read MPEG-TS from stdin (rpicam-vid outputs mpegts on Pi 5)
         "-c:v", "copy",      # no re-encode — already H.264 from the Pi GPU
+        # Inline SPS/PPS before every keyframe. On Pi 5 rpicam-vid uses libav/libx264
+        # where --inline is a no-op, so headers otherwise live only in extradata and
+        # late-joining UDP receivers never see them → "non-existing PPS" on decode.
+        "-bsf:v", "dump_extra=freq=keyframe",
         "-an",
         "-mpegts_flags", "+resend_headers",   # repeat PAT/PMT frequently
         "-muxrate", "0",                       # VBR — don't pad with nulls
@@ -272,12 +305,14 @@ def build_ffmpeg_cmd(
     slow: bool,
     hw_encode: bool,
     lossy: bool = False,
+    srt: bool = False,
+    srt_latency_ms: int = 500,
 ) -> list:
     video_size, keyframe_interval = _resolve_video_params(slow, framerate, lossy)
 
-    url1 = _udp_url(host, port)
+    url1 = _stream_url(host, port, srt=srt, srt_latency_ms=srt_latency_ms)
     if port2:
-        url2 = _udp_url(host, port2)
+        url2 = _stream_url(host, port2, srt=srt, srt_latency_ms=srt_latency_ms)
         output_args = [
             "-map", "0:v",
             "-f", "tee",
@@ -317,6 +352,10 @@ def build_ffmpeg_cmd(
             "-g", str(keyframe_interval),
             "-pix_fmt", "yuv420p",
         ]
+        # Hardware encoders don't always emit SPS/PPS in-band; force it so
+        # post-loss recovery doesn't wait for a stream restart. libx264 does
+        # this by default (repeat-headers=1), so we only need it here.
+        bsf_args = ["-bsf:v", "dump_extra=freq=keyframe"]
     else:
         encode_args = [
             "-c:v", "libx264",
@@ -328,6 +367,13 @@ def build_ffmpeg_cmd(
             "-g", str(keyframe_interval),
             "-pix_fmt", "yuv420p",
         ]
+        if lossy:
+            # slice-max-size: each slice (NAL) fits in one UDP packet of our
+            # pkt_size=1316, so a single lost packet damages one horizontal strip
+            # instead of the whole frame. libx264's sliced-threads (set by
+            # -tune zerolatency) already supports multi-slice encoding.
+            encode_args += ["-x264-params", "slice-max-size=1300"]
+        bsf_args = []
 
     return [
         "ffmpeg",
@@ -335,8 +381,13 @@ def build_ffmpeg_cmd(
         "-nostats",
         *input_args,
         *encode_args,
+        *bsf_args,
         "-r", str(framerate),
         "-an",
+        # Resend PAT/PMT on every keyframe so a late-joining or post-loss client
+        # can recover the container structure without waiting for the next cycle.
+        "-mpegts_flags", "+resend_headers",
+        "-muxrate", "0",          # VBR — don't pad with null packets
         "-muxdelay", "0",
         "-muxpreload", "0",
         "-flush_packets", "1",
@@ -442,18 +493,33 @@ def main():
                         help="Force software encoding (libx264) even when hardware is available")
     parser.add_argument("--lossy", action="store_true",
                         help="Lossy-network mode (Starlink, LTE): smaller UDP packets to avoid fragmentation, more frequent keyframes for faster error recovery")
+    parser.add_argument("--srt", action="store_true",
+                        help="Use SRT instead of raw UDP — retransmission over a latency budget. Client must also run with --srt. Requires ffmpeg built with libsrt.")
+    parser.add_argument("--srt-latency", type=int, default=500,
+                        help="SRT retransmission latency budget in ms (default: 500). Raise to 1000+ if you see 'Invalid level prefix' decoder errors on Starlink handoffs.")
     args = parser.parse_args()
 
     check_ffmpeg()
+
+    if args.srt and not has_srt_support():
+        print("[ERROR] --srt requested but ffmpeg was not built with libsrt.")
+        print("        macOS : brew tap homebrew-ffmpeg/ffmpeg && \\")
+        print("                brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-srt")
+        print("        Linux : sudo apt install ffmpeg  (recent versions include srt)")
+        sys.exit(1)
 
     if args.list_devices:
         list_devices()
         sys.exit(0)
 
-    # Slow-mode defaults
+    # Per-mode defaults. Lossy gets a lower bitrate than normal — fewer packets
+    # per second means fewer chances for Starlink/LTE handoff bursts to destroy one.
     if args.slow:
         fps     = args.fps     if args.fps != 30 else 15
         bitrate = args.bitrate or "600k"
+    elif args.lossy:
+        fps     = args.fps
+        bitrate = args.bitrate or "1200k"
     else:
         fps     = args.fps
         bitrate = args.bitrate or "2000k"
@@ -480,10 +546,12 @@ def main():
     print("=" * 56)
     print(f"  Camera     : {device}")
     print(f"  Encoder    : {enc_tag}")
-    print(f"  Target     : udp://{args.host}:{args.port}" + (f" + :{args.port2}" if args.port2 else ""))
+    proto = "srt" if args.srt else "udp"
+    print(f"  Target     : {proto}://{args.host}:{args.port}" + (f" + :{args.port2}" if args.port2 else ""))
     print(f"  Bitrate    : {bitrate}   FPS: {fps}   Slow mode: {args.slow}")
     print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'enabled (port {args.heartbeat_port}, timeout {HEARTBEAT_TIMEOUT}s)'}")
     print(f"  Lossy mode : {'ON (small pkts + frequent keyframes)' if args.lossy else 'off'}")
+    print(f"  Transport  : {f'SRT (reliable, {args.srt_latency}ms latency budget)' if args.srt else 'UDP (raw, no retransmit)'}")
     print(f"  Stats      : {'enabled (PING/PONG)' if args.stats else 'off'}")
     print(f"  Press Ctrl+C to stop.")
     print("=" * 56)
@@ -507,14 +575,14 @@ def main():
         nonlocal capture_proc, proc
         if use_libcamera:
             cap_cmd, ff_cmd = build_libcamera_cmds(
-                args.host, args.port, bitrate, fps, args.port2, args.slow, args.lossy,
+                args.host, args.port, bitrate, fps, args.port2, args.slow, args.lossy, args.srt, args.srt_latency,
             )
             capture_proc = subprocess.Popen(cap_cmd, stdout=subprocess.PIPE)
             proc = subprocess.Popen(ff_cmd, stdin=capture_proc.stdout, stdout=subprocess.PIPE)
             capture_proc.stdout.close()  # allow SIGPIPE if ffmpeg exits
         else:
             hw = not args.sw and has_hw_encoder() if IS_LINUX else False
-            cmd = build_ffmpeg_cmd(device, args.host, args.port, bitrate, fps, args.port2, args.slow, hw, args.lossy)
+            cmd = build_ffmpeg_cmd(device, args.host, args.port, bitrate, fps, args.port2, args.slow, hw, args.lossy, args.srt, args.srt_latency)
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def _stop_stream():

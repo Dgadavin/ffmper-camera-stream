@@ -1,12 +1,12 @@
-# UDP Webcam Stream over WireGuard
+# Webcam Stream over WireGuard
 
-Stream your webcam from a Raspberry Pi or macOS machine to a remote client over an encrypted WireGuard tunnel. Supports both direct connections and a hub topology (via EC2/VPS) for connecting machines behind NAT.
+Stream your webcam from a Raspberry Pi or macOS machine to a remote client over an encrypted WireGuard tunnel. Supports both direct connections and a hub topology (via EC2/VPS) for connecting machines behind NAT. Transport is UDP by default or **SRT** for links with packet loss (Starlink, LTE).
 
 ```
 Direct mode:
 [Server — RPi/macOS]            WireGuard Tunnel            [Client — macOS/Windows]
-  Webcam → ffmpeg  ──── UDP/MPEG-TS over encrypted VPN ────→ GUI → Screen
-  10.0.0.1                                                    10.0.0.2
+  Webcam → ffmpeg  ── UDP or SRT / MPEG-TS over encrypted VPN ─→ GUI → Screen
+  10.0.0.1                                                        10.0.0.2
 
 Hub mode (EC2 relay):
 [Server — RPi/macOS]      [Hub — EC2/VPS]      [Client — macOS/Windows]
@@ -117,7 +117,9 @@ python3 server.py --host 127.0.0.1 --no-keepalive
 | `--heartbeat-port` | `5010` | Port to receive heartbeats on |
 | `--stats` | off | Enable PING/PONG RTT measurement |
 | `--sw` | off | Force software encoding (skip Pi hardware encoder) |
-| `--lossy` | off | Lossy-network mode: more frequent keyframes for faster error recovery (Starlink, LTE) |
+| `--lossy` | off | Lossy-network mode: 1200k bitrate, keyframes every 0.5s, one slice per UDP packet so a dropped packet damages only a strip of the frame (Starlink, LTE) |
+| `--srt` | off | Use SRT instead of raw UDP — retransmits lost packets within a latency budget. Client must also enable SRT. Requires ffmpeg built with libsrt. |
+| `--srt-latency` | `500` | SRT retransmission budget in ms. Raise to 1000+ if you still see decoder errors on Starlink handoffs. |
 
 ---
 
@@ -126,22 +128,67 @@ python3 server.py --host 127.0.0.1 --no-keepalive
 - **Device management** — Add, edit, delete camera devices (saved to `devices.json`)
 - **Embedded video** — Stream renders directly in the application window
 - **RTT stats overlay** — Enable "Show RTT stats" per device to see latency on the video (server must also use `--stats`)
-- **Options per device** — keepalive, slow network mode, RTT stats
+- **Options per device** — keepalive, slow network mode, lossy network mode, SRT transport, RTT stats
 - **Cross-platform** — macOS and Windows (PyQt6)
+
+Each server-side flag (`--slow`, `--lossy`, `--srt`) has a matching per-device checkbox in the GUI. The two must agree: enabling "Use SRT" on the device requires the server to be started with `--srt`, otherwise the handshake fails.
 
 ---
 
-## Slow / Unreliable Network
+## Streaming Modes
 
-Use `--slow` on the server and enable "Slow network mode" on the client device:
+Pick a mode based on what's wrong with your network. `--slow` addresses bandwidth; `--lossy` addresses packet loss; `--srt` eliminates packet loss by retransmission. They combine.
 
-| What | Normal | Slow mode |
-|---|---|---|
-| Resolution | 1280x720 | 640x480 |
-| Bitrate | 2000k | 600k |
-| FPS | 30 | 15 |
-| Keyframe interval | 1s | 2s |
-| Client jitter buffer | 100ms | 500ms |
+| Mode | Resolution | Bitrate | FPS | Keyframe | Use when |
+|---|---|---|---|---|---|
+| Default | 1280×720 | 2000k | 30 | 1s | LAN / good Wi-Fi |
+| `--slow` | 640×480 | 600k | 15 | 2s | Narrow uplink (3G, DSL) |
+| `--lossy` | 1280×720 | 1200k | 30 | 0.5s | Packet loss (Starlink, LTE) |
+| `--slow --lossy` | 640×480 | 600k | 15 | 0.5s | Both bandwidth and loss |
+| `+ --srt` | (unchanged) | (unchanged) | (unchanged) | (unchanged) | Retransmits lost packets — see next section |
+
+On the client side, the matching per-device checkboxes in the GUI enlarge the jitter buffer (slow / lossy both → 500ms, default → 300ms) and switch transport protocol (SRT).
+
+---
+
+## Starlink / Lossy Networks (SRT)
+
+Raw UDP over Starlink produces visible decode artifacts ("non-existing PPS 0 referenced", green/brown blocks, "Invalid level prefix") whenever a satellite handoff drops packets. **SRT solves this** by retransmitting lost packets within a latency budget (~500ms default). The decoder never sees a loss.
+
+### Installing libsrt
+
+Both ends need ffmpeg built with **libsrt**. Verify with:
+
+```bash
+ffmpeg -hide_banner -protocols | grep -w srt
+```
+
+A single `srt` line (not `srtp`) means it's supported.
+
+**macOS** — the default Homebrew formula does not include SRT. Either:
+
+- Install a prebuilt static binary with libsrt from [evermeet.cx/ffmpeg](https://evermeet.cx/ffmpeg/) and put it ahead of Homebrew's on `PATH`, or
+- Rebuild from the homebrew-ffmpeg tap: `brew tap homebrew-ffmpeg/ffmpeg && brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-srt` (needs current Xcode Command Line Tools).
+
+**Linux / Raspberry Pi** — recent `apt install ffmpeg` already includes libsrt.
+
+### Usage
+
+Start the **client first** (it's the SRT listener), then the server. If the server runs first, its caller will hit "Input/output error" because nothing is listening.
+
+```bash
+# Client (GUI): edit device → tick "Use SRT (reliable transport)" → double-click to connect
+python3 client_gui.py
+
+# Server (after client is connected):
+python3 server.py --host <CLIENT_IP> --srt
+```
+
+To tune the retransmission window for particularly bad satellite handoffs:
+```bash
+python3 server.py --host <CLIENT_IP> --srt --srt-latency 1000
+```
+Higher latency = more recovery headroom = more end-to-end delay. For a one-way camera feed, 500–1000ms is imperceptible.
 
 ---
 
@@ -149,9 +196,12 @@ Use `--slow` on the server and enable "Slow network mode" on the client device:
 
 The client sends a UDP heartbeat to the server every 2 seconds. The server waits for the first heartbeat before starting the stream, and pauses if heartbeats stop for 8 seconds. When the client reconnects, the stream resumes automatically.
 
+In SRT mode, the GUI client delays the first heartbeat by ~1s to ensure its SRT listener has bound the port before the server's caller tries to connect.
+
 To disable (e.g. for quick tests), use `--no-keepalive` on the server and uncheck "Send keepalive" on the client device.
 
-Ports used:
+Ports used (same for UDP and SRT — SRT runs on top of UDP):
+
 - `5000` — video stream
 - `5001` — video stream (save, when using `--port2`)
 - `5010` — heartbeat channel
@@ -214,10 +264,10 @@ Then add the client peer on the server as described above.
 
 ## Architecture
 
-- **Transport**: UDP unicast — server pushes to client IP
+- **Transport**: UDP unicast by default (fire-and-forget), or SRT (retransmission within a latency budget) when both ends opt in. Server pushes to client IP; with SRT the server is the caller and the client is the listener.
 - **Container**: MPEG-TS — no seeking needed, resilient to packet loss
-- **Codec**: H.264 — Pi GPU encoder (rpicam-vid) or libx264 ultrafast+zerolatency
-- **Keep-alive**: UDP heartbeat side-channel on port 5010
+- **Codec**: H.264 — Pi GPU encoder (rpicam-vid) or libx264 ultrafast+zerolatency. In `--lossy` mode libx264 emits one slice per UDP packet (`slice-max-size=1300`) so a dropped packet damages a single horizontal strip instead of the whole frame.
+- **Keep-alive**: UDP heartbeat side-channel on port 5010. The GUI client waits to send the first heartbeat until its SRT listener is bound, so the server's caller doesn't race ahead.
 - **Encryption**: WireGuard (ChaCha20-Poly1305) wraps all traffic
 - **Client rendering**: ffmpeg decodes stream → raw RGB frames → PyQt6 QLabel
 
@@ -235,3 +285,7 @@ Then add the client peer on the server as described above.
 | Tunnel not working | `wg show` on both machines; `ping 10.0.0.1` from client |
 | Pi camera VIDIOC error | Ensure rpicam-vid is installed; don't use `--device /dev/video0` for Pi camera module |
 | GUI blank/no text (macOS) | Ensure PyQt6 is installed: `pip install PyQt6` |
+| `non-existing PPS 0 referenced` / block artifacts | Packet loss is damaging IDRs. Add `--lossy` on the server, or switch to `--srt` to eliminate loss entirely. |
+| `Invalid level prefix` / `error while decoding MB` with SRT on | A packet couldn't be retransmitted within the latency budget. Raise it: `--srt-latency 1000`. |
+| Server: `srt://…: Input/output error` | Client's SRT listener wasn't up when the caller connected. Start the client first, then the server. |
+| Server: `--srt requested but ffmpeg was not built with libsrt` | See [Installing libsrt](#installing-libsrt). |
