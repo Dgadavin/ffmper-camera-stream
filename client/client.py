@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-UDP Video Streaming Client — Receive & play over WireGuard
-==========================================================
+UDP Video Streaming Client — Receive & play (single-port multiplex)
+====================================================================
 Listens on a UDP port and plays the incoming MPEG-TS stream in real time.
-Sends UDP heartbeats to the server so it knows the client is alive.
-Includes jitter buffer tuning for slow/unreliable networks.
+The same port carries heartbeat ALIVE / PING-PONG packets — there is no
+separate heartbeat channel, so a single nanoping/wg flow is enough.
+
+Two consumers live in this codebase:
+  - GUI (client_gui.py): UdpDemuxer (below) owns the listening socket
+    and pipes MPEG-TS into ffmpeg's stdin. PING/PONG flows on the same
+    socket → symmetric port pair, plays nicely with nanoping.
+  - CLI (this file's main): hands the UDP socket to ffplay/ffmpeg, and
+    runs HeartbeatSender from a separate ephemeral source port. Simple,
+    works through plain WireGuard. For nanoping use the GUI.
 
 Requirements:
     brew install ffmpeg        # macOS
     sudo apt install ffmpeg    # Linux
 
 Usage:
-    python3 client.py                                          # play live (heartbeats to 10.0.0.1)
-    python3 client.py --server-host 10.0.0.1                   # explicit server IP for heartbeats
-    python3 client.py --server-host 10.0.0.1 --save out.mp4   # play + save (server needs --port2 5001)
-    python3 client.py --no-play --save out.mp4                 # save only, no playback window
-    python3 client.py --slow                                   # larger jitter buffer for bad links
-    python3 client.py --no-keepalive                           # disable heartbeat sender
-    python3 client.py --server-host 127.0.0.1 --no-keepalive  # localhost test
+    python3 client.py
+    python3 client.py --server-host 10.0.0.1
+    python3 client.py --server-host 10.0.0.1 --save out.mp4
+    python3 client.py --no-play --save out.mp4
+    python3 client.py --slow
+    python3 client.py --no-keepalive
+    python3 client.py --server-host 127.0.0.1 --no-keepalive
 """
 
 import subprocess
@@ -32,12 +40,13 @@ import time
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-HEARTBEAT_PORT     = 5010
 HEARTBEAT_INTERVAL = 2           # seconds between heartbeat packets
 HEARTBEAT_MAGIC    = b"ALIVE"
+TS_SYNC            = 0x47        # MPEG-TS packet sync byte
+PKT_SIZE           = 1316        # 7 × 188-byte TS packets
 
 
-# ── keep-alive sender ─────────────────────────────────────────────────────────
+# ── keep-alive sender (CLI: ephemeral source port, separate socket) ──────────
 
 class HeartbeatSender:
     """
@@ -114,7 +123,122 @@ class HeartbeatSender:
 
     def stop(self):
         self._stop_event.set()
-        self._sock.close()
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+# ── single-socket demuxer (GUI: video + heartbeat share one port) ────────────
+
+class UdpDemuxer:
+    """
+    Owns the listening UDP socket. Demultiplexes incoming datagrams:
+      - first byte 0x47        → MPEG-TS, written to ffmpeg's stdin
+      - prefix b"PONG:"        → RTT sample, exposed via rtt_* attrs
+    Periodically sends ALIVE / PING:<ts> from the same socket. Because the
+    server's reply comes back to the same (port, IP), the heartbeat path
+    stays inside whatever single nanoping/wg flow already routes the video.
+
+    Attribute names (rtt_last, rtt_min, rtt_max, _rtt_sum, _rtt_count, _lock)
+    match HeartbeatSender so the GUI's stats overlay can read either.
+    """
+    def __init__(self, server_host: str, port: int, ff_stdin, *,
+                 keepalive: bool = True, stats: bool = False):
+        self.server_addr = (server_host, port)
+        self.port        = port
+        self.ff_stdin    = ff_stdin
+        self.keepalive   = keepalive
+        self.stats       = stats
+        self._stop       = threading.Event()
+        self._lock       = threading.Lock()
+        self.rtt_last    = None
+        self.rtt_min     = None
+        self.rtt_max     = None
+        self._rtt_sum    = 0.0
+        self._rtt_count  = 0
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        except OSError:
+            pass
+        self._sock.bind(("0.0.0.0", port))
+        self._sock.settimeout(1.0)
+
+    def start(self):
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+        # Stats also need periodic outbound packets — PING doubles as RTT probe
+        # AND keepalive, so we run the ping loop whenever either is on.
+        if self.keepalive or self.stats:
+            threading.Thread(target=self._ping_loop, daemon=True).start()
+        mode = "PING/PONG (stats)" if self.stats \
+            else "ALIVE" if self.keepalive else "off"
+        print(f"[CLIENT] UDP socket bound :{self.port}  heartbeat: {mode}")
+
+    def _recv_loop(self):
+        while not self._stop.is_set():
+            try:
+                data, _ = self._sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data:
+                continue
+            if data[0] == TS_SYNC:
+                # MPEG-TS datagram → forward to ffmpeg's stdin.
+                try:
+                    self.ff_stdin.write(data)
+                    self.ff_stdin.flush()
+                except (BrokenPipeError, ValueError, OSError):
+                    break
+            elif data.startswith(b"PONG:") and self.stats:
+                try:
+                    sent_ts = int(data[5:])
+                except ValueError:
+                    continue
+                rtt = time.time() * 1000 - sent_ts
+                with self._lock:
+                    first = self.rtt_last is None
+                    self.rtt_last = rtt
+                    self._rtt_count += 1
+                    self._rtt_sum += rtt
+                    if self.rtt_min is None or rtt < self.rtt_min:
+                        self.rtt_min = rtt
+                    if self.rtt_max is None or rtt > self.rtt_max:
+                        self.rtt_max = rtt
+                if first:
+                    print(f"[CLIENT] first PONG received — RTT {rtt:.0f}ms (return path OK)")
+
+    def _ping_loop(self):
+        sent = 0
+        while not self._stop.is_set():
+            try:
+                if self.stats:
+                    ts = int(time.time() * 1000)
+                    self._sock.sendto(f"PING:{ts}".encode(), self.server_addr)
+                else:
+                    self._sock.sendto(HEARTBEAT_MAGIC, self.server_addr)
+                sent += 1
+                # Periodic visibility so the user can tell PINGs are leaving
+                # even when no PONGs come back (return path broken / nanoping
+                # one-way wiring).
+                if self.stats and sent % 5 == 1:
+                    print(f"[CLIENT] sent {sent} PING{'s' if sent != 1 else ''} "
+                          f"to {self.server_addr[0]}:{self.server_addr[1]} "
+                          f"(rtt_last={self.rtt_last})")
+            except Exception:
+                pass
+            self._stop.wait(HEARTBEAT_INTERVAL)
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except Exception:
+            pass
 
 
 # ── ffmpeg/ffplay command builders ────────────────────────────────────────────
@@ -187,10 +311,10 @@ def kill_proc(proc):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="UDP stream client — plays the server's webcam feed"
+        description="UDP stream client (CLI) — heartbeat shares the video port"
     )
     parser.add_argument("--port",     type=int, default=5000,
-                        help="UDP port to listen on (default: 5000). Must match server.")
+                        help="UDP port to listen on (default: 5000). Must match server's --port.")
     parser.add_argument("--save",     default=None, metavar="FILE",
                         help="Save stream to file (e.g. recording.mp4). Can combine with playback.")
     parser.add_argument("--no-play",  action="store_true",
@@ -201,8 +325,8 @@ def main():
                         help="Disable heartbeat sender (server must use --no-keepalive too)")
     parser.add_argument("--server-host", default="10.0.0.1",
                         help="Server IP to send heartbeats to (default: 10.0.0.1). Use 127.0.0.1 for localhost test.")
-    parser.add_argument("--heartbeat-port", type=int, default=HEARTBEAT_PORT,
-                        help=f"UDP port to send heartbeats to (default: {HEARTBEAT_PORT})")
+    parser.add_argument("--server-port", type=int, default=None,
+                        help="Heartbeat destination port on the server (default: --port). Override only if the server's --bind-port differs from --port.")
     parser.add_argument("--stats", action="store_true",
                         help="Enable RTT measurement via heartbeat PING/PONG (use with --stats on server)")
     args = parser.parse_args()
@@ -211,21 +335,19 @@ def main():
         print("[ERROR] --no-play requires --save (nothing to do otherwise).")
         sys.exit(1)
 
-    if args.stats and args.no_keepalive:
-        print("[ERROR] --stats requires heartbeat (cannot use with --no-keepalive).")
-        sys.exit(1)
-
     check_deps(play=not args.no_play)
+
+    server_port = args.server_port if args.server_port is not None else args.port
 
     print()
     print("=" * 56)
-    print("  UDP Stream Client")
+    print("  UDP Stream Client (CLI)")
     print("=" * 56)
     print(f"  Listening  : udp://0.0.0.0:{args.port}")
     print(f"  Playback   : {'no' if args.no_play else 'yes (ffplay window)'}")
     print(f"  Save to    : {args.save or 'no'}")
     print(f"  Slow mode  : {args.slow}")
-    print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'sending to {args.server_host}:{args.heartbeat_port}'}")
+    print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'sending to {args.server_host}:{server_port}'}")
     print(f"  Stats      : {'enabled (RTT measurement)' if args.stats else 'off'}")
     if args.save and not args.no_play:
         print(f"  Save port  : {args.port + 1}  (server must use --port2 {args.port + 1})")
@@ -234,9 +356,10 @@ def main():
     print()
 
     # ── start heartbeat ──
+    # Stats mode sends PINGs even with --no-keepalive (PING doubles as RTT probe).
     heartbeat = None
-    if not args.no_keepalive:
-        heartbeat = HeartbeatSender(args.server_host, args.heartbeat_port, stats=args.stats)
+    if not args.no_keepalive or args.stats:
+        heartbeat = HeartbeatSender(args.server_host, server_port, stats=args.stats)
         heartbeat.start()
 
     # ── launch ffplay / ffmpeg ──

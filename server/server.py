@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
-UDP Video Streaming Server — Webcam capture over WireGuard (macOS / Linux / Raspberry Pi)
-=========================================================================================
-Captures the local webcam and streams MPEG-TS over UDP.
-Auto-detects platform:
-  - macOS:  AVFoundation capture
-  - Linux:  V4L2 capture (Raspberry Pi, USB webcams, etc.)
+UDP Video Streaming Server — Webcam capture (single-port multiplex)
+====================================================================
+Captures the local webcam and streams MPEG-TS over UDP. A single UDP
+socket carries both the video datagrams and the heartbeat PING/PONG —
+no second port required, friendly to nanoping/wg flow rules.
 
-Includes keep-alive: stops streaming if client heartbeat stops arriving.
-Includes slow-network mode: lower bitrate, smaller resolution, more keyframes.
+Auto-detects platform:
+  - macOS:           AVFoundation capture
+  - Linux (USB cam): V4L2 capture
+  - Linux (Pi cam):  libcamera/rpicam-vid (GPU H.264)
 
 Requirements:
     macOS:  brew install ffmpeg
     Linux:  sudo apt install ffmpeg
 
 Usage:
-    python3 server.py                              # auto-detect webcam, stream to 10.0.0.2:5000
-    python3 server.py --host 10.0.0.2              # explicit peer IP
-    python3 server.py --device 1                   # pick camera (index on macOS, /dev/videoN on Linux)
-    python3 server.py --list-devices               # show all available cameras
-    python3 server.py --slow                       # slow-network mode (low bitrate/fps)
-    python3 server.py --host 10.0.0.2 --port2 5001 # also stream to second port (play+save)
+    python3 server.py                                # auto-detect, stream to 10.0.0.2:5000
+    python3 server.py --host 10.0.0.2                # explicit peer IP
+    python3 server.py --device 1                     # pick camera
+    python3 server.py --list-devices                 # show all available cameras
+    python3 server.py --slow                         # slow-network mode
+    python3 server.py --host 10.0.0.2 --port2 5001   # also fan out to a second port
+    python3 server.py --bind-port 5005 --no-keepalive  # localhost test (avoid bind clash)
 """
 
 import subprocess
@@ -38,10 +40,10 @@ import glob as globmod
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-HEARTBEAT_PORT      = 5010        # client sends UDP heartbeats here
-HEARTBEAT_INTERVAL  = 2           # client sends every N seconds
-HEARTBEAT_TIMEOUT   = 8           # server pauses stream after N seconds of silence
-HEARTBEAT_MAGIC     = b"ALIVE"
+HEARTBEAT_TIMEOUT = 8           # pause stream after N seconds of client silence
+HEARTBEAT_MAGIC   = b"ALIVE"
+TS_SYNC           = 0x47        # MPEG-TS packet sync byte
+PKT_SIZE          = 1316        # 7 × 188-byte TS packets — fits inside any tunnel MTU
 
 
 IS_LINUX = platform.system() == "Linux"
@@ -81,19 +83,6 @@ def has_hw_encoder() -> bool:
         capture_output=True, text=True
     )
     return "h264_v4l2m2m" in result.stdout
-
-
-def has_srt_support() -> bool:
-    """Check if ffmpeg was built with libsrt."""
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-protocols"],
-        capture_output=True, text=True
-    )
-    # Filter output to avoid matching srtp (Secure RTP) lines.
-    for line in result.stdout.splitlines():
-        if line.strip() == "srt":
-            return True
-    return False
 
 
 def is_v4l2_capture_capable(device: str) -> bool:
@@ -159,12 +148,10 @@ def detect_default_camera() -> str:
         print("         Run with --list-devices to see all options.")
         return "0"
     else:
-        # Raspberry Pi camera module — use libcamera
         if has_libcamera():
             print(f"[SERVER] Pi camera detected (via {libcamera_bin()})")
             return "libcamera:0"
 
-        # USB webcam fallback — find first capture-capable V4L2 device
         devices = sorted(globmod.glob("/dev/video*"))
         for dev in devices:
             if is_v4l2_capture_capable(dev):
@@ -205,37 +192,17 @@ def _resolve_video_params(slow: bool, framerate: int, lossy: bool = False):
     return resolution, keyframe_interval
 
 
-def _stream_url(host: str, port: int, srt: bool = False, srt_latency_ms: int = 500) -> str:
-    """Build destination URL. UDP is fire-and-forget; SRT adds retransmission
-    on a configurable latency budget (great for Starlink/LTE).
-
-    500ms covers Starlink satellite-handoff gaps; raise to 1000ms if you still
-    see "Invalid level prefix" decoder errors."""
-    if srt:
-        # mode=caller → server initiates connection to the client's listener.
-        # latency is in microseconds — window of retransmission tolerance.
-        latency_us = srt_latency_ms * 1000
-        return f"srt://{host}:{port}?mode=caller&latency={latency_us}&pkt_size=1316"
-    # 7 × 188-byte TS packets = 1316 bytes — flushes to network sooner,
-    # fits inside any tunnel MTU, and avoids IP fragmentation
-    return f"udp://{host}:{port}?pkt_size=1316"
-
-
 def build_libcamera_cmds(
-    host: str,
-    port: int,
     bitrate: str,
     framerate: int,
-    port2: int | None,
     slow: bool,
     lossy: bool = False,
-    srt: bool = False,
-    srt_latency_ms: int = 500,
 ):
     """
     Build a (rpicam-vid command, ffmpeg command) pair.
     rpicam-vid captures + H.264 encodes on the Pi GPU, outputs to stdout.
-    ffmpeg reads the raw H.264 from stdin and repackages as MPEG-TS over UDP.
+    ffmpeg reads the raw H.264 from stdin and repackages as MPEG-TS on stdout
+    (so the Python forwarder can chunk the byte stream into UDP datagrams).
     """
     video_size, keyframe_interval = _resolve_video_params(slow, framerate, lossy)
     width, height = video_size.split("x")
@@ -245,7 +212,7 @@ def build_libcamera_cmds(
 
     capture_cmd = [
         libcamera_bin(),
-        "--codec", "h264",          # H.264 encoding
+        "--codec", "h264",
         "--libav-format", "mpegts", # MPEG-TS container with proper timestamps (Pi 5)
         "--width", width,
         "--height", height,
@@ -261,23 +228,12 @@ def build_libcamera_cmds(
         "--output", "-",      # stdout
     ]
 
-    url1 = _stream_url(host, port, srt=srt, srt_latency_ms=srt_latency_ms)
-    if port2:
-        url2 = _stream_url(host, port2, srt=srt, srt_latency_ms=srt_latency_ms)
-        output_args = [
-            "-map", "0:v",
-            "-f", "tee",
-            f"[f=mpegts]{url1}|[f=mpegts]{url2}",
-        ]
-    else:
-        output_args = ["-map", "0:v", "-f", "mpegts", url1]
-
     ffmpeg_cmd = [
         "ffmpeg",
         "-loglevel", "warning",
         "-nostats",
         "-f", "mpegts",
-        "-i", "pipe:0",      # read MPEG-TS from stdin (rpicam-vid outputs mpegts on Pi 5)
+        "-i", "pipe:0",      # read MPEG-TS from stdin
         "-c:v", "copy",      # no re-encode — already H.264 from the Pi GPU
         # Inline SPS/PPS before every keyframe. On Pi 5 rpicam-vid uses libav/libx264
         # where --inline is a no-op, so headers otherwise live only in extradata and
@@ -289,7 +245,9 @@ def build_libcamera_cmds(
         "-muxdelay", "0",                      # no muxer buffering (default 0.7s!)
         "-muxpreload", "0",
         "-flush_packets", "1",
-        *output_args,
+        "-map", "0:v",
+        "-f", "mpegts",
+        "pipe:1",            # MPEG-TS to stdout — the forwarder ships it as UDP
     ]
 
     return capture_cmd, ffmpeg_cmd
@@ -297,29 +255,13 @@ def build_libcamera_cmds(
 
 def build_ffmpeg_cmd(
     device: str,
-    host: str,
-    port: int,
     bitrate: str,
     framerate: int,
-    port2: int | None,
     slow: bool,
     hw_encode: bool,
     lossy: bool = False,
-    srt: bool = False,
-    srt_latency_ms: int = 500,
 ) -> list:
     video_size, keyframe_interval = _resolve_video_params(slow, framerate, lossy)
-
-    url1 = _stream_url(host, port, srt=srt, srt_latency_ms=srt_latency_ms)
-    if port2:
-        url2 = _stream_url(host, port2, srt=srt, srt_latency_ms=srt_latency_ms)
-        output_args = [
-            "-map", "0:v",
-            "-f", "tee",
-            f"[f=mpegts]{url1}|[f=mpegts]{url2}",
-        ]
-    else:
-        output_args = ["-map", "0:v", "-f", "mpegts", url1]
 
     # ── platform-specific input ──
     if IS_MACOS:
@@ -353,8 +295,7 @@ def build_ffmpeg_cmd(
             "-pix_fmt", "yuv420p",
         ]
         # Hardware encoders don't always emit SPS/PPS in-band; force it so
-        # post-loss recovery doesn't wait for a stream restart. libx264 does
-        # this by default (repeat-headers=1), so we only need it here.
+        # post-loss recovery doesn't wait for a stream restart.
         bsf_args = ["-bsf:v", "dump_extra=freq=keyframe"]
     else:
         encode_args = [
@@ -368,10 +309,9 @@ def build_ffmpeg_cmd(
             "-pix_fmt", "yuv420p",
         ]
         if lossy:
-            # slice-max-size: each slice (NAL) fits in one UDP packet of our
-            # pkt_size=1316, so a single lost packet damages one horizontal strip
-            # instead of the whole frame. libx264's sliced-threads (set by
-            # -tune zerolatency) already supports multi-slice encoding.
+            # slice-max-size: each slice (NAL) fits in one UDP datagram of our
+            # PKT_SIZE=1316, so a single lost packet damages one horizontal strip
+            # instead of the whole frame.
             encode_args += ["-x264-params", "slice-max-size=1300"]
         bsf_args = []
 
@@ -391,51 +331,101 @@ def build_ffmpeg_cmd(
         "-muxdelay", "0",
         "-muxpreload", "0",
         "-flush_packets", "1",
-        *output_args,
+        "-map", "0:v",
+        "-f", "mpegts",
+        "pipe:1",
     ]
 
 
-# ── keep-alive listener ───────────────────────────────────────────────────────
+# ── single-port video forwarder + heartbeat responder ────────────────────────
 
-class HeartbeatListener:
+class VideoUdpForwarder:
     """
-    Listens for UDP heartbeat packets from the client.
-    Tracks last-seen time so the main loop can pause/resume streaming.
+    Owns one UDP socket that does double duty:
+      - sends MPEG-TS datagrams (read from ffmpeg's stdout) to each destination
+      - receives ALIVE / PING:<ts> heartbeats and replies PONG:<ts> on the same socket
+
+    The control loop runs continuously; the video pump can be attached/detached
+    so a paused stream (client disconnected) can release ffmpeg without
+    tearing down the socket.
     """
-    def __init__(self, port: int):
-        self.port          = port
-        self.last_seen     = 0.0          # epoch seconds; 0 = never seen
-        self._sock         = None
-        self._thread       = None
-        self._stop_event   = threading.Event()
+    def __init__(self, bind_port: int, destinations: list):
+        self.bind_port    = bind_port
+        self.destinations = destinations  # list of (host, port)
+        self.last_seen    = 0.0
+        self._stop_ctrl   = threading.Event()
+        self._stop_video  = threading.Event()
+        self._sock        = None
+        self._video_thread = None
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("0.0.0.0", self.port))
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        except OSError:
+            pass
+        self._sock.bind(("0.0.0.0", self.bind_port))
         self._sock.settimeout(1.0)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        print(f"[SERVER] Heartbeat listener on udp://0.0.0.0:{self.port}")
+        threading.Thread(target=self._control_loop, daemon=True).start()
+        dests = ", ".join(f"{h}:{p}" for h, p in self.destinations)
+        print(f"[SERVER] UDP socket on :{self.bind_port}  →  {dests}")
 
-    def _run(self):
-        while not self._stop_event.is_set():
+    def attach_video(self, ff_stdout):
+        self._stop_video.clear()
+        self._video_thread = threading.Thread(
+            target=self._video_pump, args=(ff_stdout,), daemon=True,
+        )
+        self._video_thread.start()
+
+    def detach_video(self):
+        self._stop_video.set()
+        if self._video_thread:
+            self._video_thread.join(timeout=2)
+            self._video_thread = None
+
+    def _video_pump(self, ff_stdout):
+        # MPEG-TS muxer emits 188-byte aligned packets; we accumulate until we
+        # have PKT_SIZE bytes (7 packets) before flushing one UDP datagram.
+        # read1 returns whatever's available in the underlying syscall — no
+        # waiting for a full PKT_SIZE worth of bytes to land in BufferedReader.
+        buf = b""
+        while not self._stop_video.is_set():
             try:
-                data, addr = self._sock.recvfrom(128)
-                if data == HEARTBEAT_MAGIC:
-                    if self.last_seen == 0:
-                        print(f"[SERVER] Client connected from {addr[0]}")
-                    self.last_seen = time.time()
-                elif data.startswith(b"PING:"):
-                    if self.last_seen == 0:
-                        print(f"[SERVER] Client connected from {addr[0]}")
-                    self.last_seen = time.time()
-                    # Echo timestamp back for RTT measurement
-                    self._sock.sendto(b"PONG:" + data[5:], addr)
+                chunk = ff_stdout.read1(PKT_SIZE - len(buf))
+            except (ValueError, OSError):
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= PKT_SIZE:
+                for dst in self.destinations:
+                    try:
+                        self._sock.sendto(buf[:PKT_SIZE], dst)
+                    except Exception:
+                        pass
+                buf = buf[PKT_SIZE:]
+
+    def _control_loop(self):
+        while not self._stop_ctrl.is_set():
+            try:
+                data, addr = self._sock.recvfrom(256)
             except socket.timeout:
                 continue
-            except Exception:
+            except OSError:
                 break
+            if data == HEARTBEAT_MAGIC:
+                if self.last_seen == 0:
+                    print(f"[SERVER] Client connected from {addr[0]}:{addr[1]}")
+                self.last_seen = time.time()
+            elif data.startswith(b"PING:"):
+                if self.last_seen == 0:
+                    print(f"[SERVER] Client connected from {addr[0]}:{addr[1]}")
+                self.last_seen = time.time()
+                try:
+                    self._sock.sendto(b"PONG:" + data[5:], addr)
+                except Exception:
+                    pass
 
     def is_alive(self) -> bool:
         if self.last_seen == 0:
@@ -443,14 +433,20 @@ class HeartbeatListener:
         return (time.time() - self.last_seen) < HEARTBEAT_TIMEOUT
 
     def stop(self):
-        self._stop_event.set()
+        self._stop_ctrl.set()
+        self._stop_video.set()
         if self._sock:
-            self._sock.close()
+            try:
+                self._sock.close()
+            except Exception:
+                pass
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def kill_proc(proc):
+    if proc is None:
+        return
     try:
         proc.stdin.write(b"q\n")
         proc.stdin.flush()
@@ -465,7 +461,7 @@ def kill_proc(proc):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Webcam → UDP stream server (macOS / Linux / Raspberry Pi)"
+        description="Webcam → UDP stream server (single-port: video + heartbeat multiplexed)"
     )
     parser.add_argument("--list-devices", action="store_true",
                         help="List available camera devices and exit.")
@@ -474,39 +470,26 @@ def main():
     parser.add_argument("--host",     default="10.0.0.2",
                         help="Client IP to stream to (default: 10.0.0.2)")
     parser.add_argument("--port",     type=int, default=5000,
-                        help="UDP destination port (default: 5000)")
+                        help="UDP destination port on the client (default: 5000)")
     parser.add_argument("--port2",    type=int, default=None,
-                        help="Second UDP port for play+save mode on client")
+                        help="Optional second destination port for fan-out (e.g. play+save on the client)")
+    parser.add_argument("--bind-port", type=int, default=None,
+                        help="Local UDP bind port (default: --port). Override only if you need a different bind, e.g. localhost test.")
     parser.add_argument("--bitrate",  default=None,
-                        help="Video bitrate. Defaults: 2000k normal, 600k slow mode.")
+                        help="Video bitrate. Defaults: 2000k normal, 1200k lossy, 600k slow.")
     parser.add_argument("--fps",      type=int, default=30,
                         help="Frames per second (default: 30; use 15 for slow links)")
     parser.add_argument("--slow",     action="store_true",
                         help="Slow-network mode: 640x480, 600k bitrate, 15fps, more keyframes")
     parser.add_argument("--no-keepalive", action="store_true",
                         help="Disable keep-alive (stream even if client is not responding)")
-    parser.add_argument("--heartbeat-port", type=int, default=HEARTBEAT_PORT,
-                        help=f"UDP port to receive client heartbeats on (default: {HEARTBEAT_PORT})")
-    parser.add_argument("--stats", action="store_true",
-                        help="Enable RTT measurement via heartbeat PING/PONG")
     parser.add_argument("--sw", action="store_true",
                         help="Force software encoding (libx264) even when hardware is available")
     parser.add_argument("--lossy", action="store_true",
-                        help="Lossy-network mode (Starlink, LTE): smaller UDP packets to avoid fragmentation, more frequent keyframes for faster error recovery")
-    parser.add_argument("--srt", action="store_true",
-                        help="Use SRT instead of raw UDP — retransmission over a latency budget. Client must also run with --srt. Requires ffmpeg built with libsrt.")
-    parser.add_argument("--srt-latency", type=int, default=500,
-                        help="SRT retransmission latency budget in ms (default: 500). Raise to 1000+ if you see 'Invalid level prefix' decoder errors on Starlink handoffs.")
+                        help="Lossy-network mode (Starlink, LTE): smaller UDP packets, more frequent keyframes")
     args = parser.parse_args()
 
     check_ffmpeg()
-
-    if args.srt and not has_srt_support():
-        print("[ERROR] --srt requested but ffmpeg was not built with libsrt.")
-        print("        macOS : brew tap homebrew-ffmpeg/ffmpeg && \\")
-        print("                brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-srt")
-        print("        Linux : sudo apt install ffmpeg  (recent versions include srt)")
-        sys.exit(1)
 
     if args.list_devices:
         list_devices()
@@ -525,6 +508,7 @@ def main():
         bitrate = args.bitrate or "2000k"
 
     device = args.device or detect_default_camera()
+    bind_port = args.bind_port if args.bind_port is not None else args.port
 
     # Determine capture mode
     use_libcamera = device.startswith("libcamera:")
@@ -540,30 +524,32 @@ def main():
         hw_encode = not args.sw and has_hw_encoder()
         enc_tag   = "h264_v4l2m2m (hw)" if hw_encode else "libx264 (sw)"
 
+    destinations = [(args.host, args.port)]
+    if args.port2:
+        destinations.append((args.host, args.port2))
+
     print()
     print("=" * 56)
     print(f"  UDP Webcam Streaming Server  [{plat_tag}]")
     print("=" * 56)
     print(f"  Camera     : {device}")
     print(f"  Encoder    : {enc_tag}")
-    proto = "srt" if args.srt else "udp"
-    print(f"  Target     : {proto}://{args.host}:{args.port}" + (f" + :{args.port2}" if args.port2 else ""))
+    dests_str = " + ".join(f"{h}:{p}" for h, p in destinations)
+    print(f"  Target     : udp://{dests_str}  (bound :{bind_port})")
     print(f"  Bitrate    : {bitrate}   FPS: {fps}   Slow mode: {args.slow}")
-    print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'enabled (port {args.heartbeat_port}, timeout {HEARTBEAT_TIMEOUT}s)'}")
+    print(f"  Keep-alive : {'disabled' if args.no_keepalive else f'enabled (timeout {HEARTBEAT_TIMEOUT}s, same socket)'}")
     print(f"  Lossy mode : {'ON (small pkts + frequent keyframes)' if args.lossy else 'off'}")
-    print(f"  Transport  : {f'SRT (reliable, {args.srt_latency}ms latency budget)' if args.srt else 'UDP (raw, no retransmit)'}")
-    print(f"  Stats      : {'enabled (PING/PONG)' if args.stats else 'off'}")
     print(f"  Press Ctrl+C to stop.")
     print("=" * 56)
     print()
 
-    # ── keep-alive setup ──
-    heartbeat = None
+    # ── socket up first; ffmpeg comes online once a client is alive ──
+    forwarder = VideoUdpForwarder(bind_port, destinations)
+    forwarder.start()
+
     if not args.no_keepalive:
-        heartbeat = HeartbeatListener(args.heartbeat_port)
-        heartbeat.start()
         print("[SERVER] Waiting for client heartbeat before starting stream...")
-        while not heartbeat.is_alive():
+        while not forwarder.is_alive():
             time.sleep(0.5)
         print("[SERVER] Client alive — starting stream.")
 
@@ -574,31 +560,32 @@ def main():
     def _start_stream():
         nonlocal capture_proc, proc
         if use_libcamera:
-            cap_cmd, ff_cmd = build_libcamera_cmds(
-                args.host, args.port, bitrate, fps, args.port2, args.slow, args.lossy, args.srt, args.srt_latency,
-            )
+            cap_cmd, ff_cmd = build_libcamera_cmds(bitrate, fps, args.slow, args.lossy)
             capture_proc = subprocess.Popen(cap_cmd, stdout=subprocess.PIPE)
             proc = subprocess.Popen(ff_cmd, stdin=capture_proc.stdout, stdout=subprocess.PIPE)
-            capture_proc.stdout.close()  # allow SIGPIPE if ffmpeg exits
+            capture_proc.stdout.close()  # let SIGPIPE propagate if ffmpeg exits
         else:
             hw = not args.sw and has_hw_encoder() if IS_LINUX else False
-            cmd = build_ffmpeg_cmd(device, args.host, args.port, bitrate, fps, args.port2, args.slow, hw, args.lossy, args.srt, args.srt_latency)
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            cmd = build_ffmpeg_cmd(device, bitrate, fps, args.slow, hw, args.lossy)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        forwarder.attach_video(proc.stdout)
 
     def _stop_stream():
         nonlocal capture_proc, proc
+        # Kill capture (rpicam-vid) first so ffmpeg sees stdin EOF and exits cleanly,
+        # then kill ffmpeg, then join the forwarder pump (it'll drop out on EOF).
         if capture_proc:
             kill_proc(capture_proc)
             capture_proc = None
         if proc:
             kill_proc(proc)
             proc = None
+        forwarder.detach_video()
 
     def _shutdown(sig, frame):
         print("\n[SERVER] Shutting down...")
         _stop_stream()
-        if heartbeat:
-            heartbeat.stop()
+        forwarder.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
@@ -626,12 +613,12 @@ def main():
                 break
 
             # Keep-alive check
-            if heartbeat and not heartbeat.is_alive():
-                if heartbeat.last_seen > 0:
+            if not args.no_keepalive and not forwarder.is_alive():
+                if forwarder.last_seen > 0:
                     print("[SERVER] Client heartbeat lost — pausing stream...")
                     _stop_stream()
                     print("[SERVER] Waiting for client to reconnect...")
-                    while not heartbeat.is_alive():
+                    while not forwarder.is_alive():
                         time.sleep(0.5)
                     print("[SERVER] Client reconnected — restarting stream.")
                     _start_stream()

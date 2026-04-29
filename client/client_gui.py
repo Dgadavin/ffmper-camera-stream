@@ -13,7 +13,6 @@ import os
 import shutil
 import subprocess
 import threading
-import time
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -24,10 +23,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QFont, QImage, QPixmap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from client import (
-    HeartbeatSender,
-    HEARTBEAT_PORT,
-)
+from client import UdpDemuxer
 
 DEVICES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.json")
 
@@ -76,33 +72,21 @@ class StreamClient:
     def heartbeat(self):
         return self._heartbeat
 
-    def start(self, host, port, slow, keepalive, stats, lossy=False, srt=False):
+    def start(self, host, port, slow, keepalive, stats, lossy=False):
         self._running = True
         threading.Thread(
-            target=self._run, args=(host, port, slow, keepalive, stats, lossy, srt), daemon=True,
+            target=self._run, args=(host, port, slow, keepalive, stats, lossy), daemon=True,
         ).start()
 
-    def _run(self, host, port, slow, keepalive, stats, lossy, srt):
+    def _run(self, host, port, slow, keepalive, stats, lossy):
         try:
             self.on_status("Connecting...")
 
-            # 300ms absorbs normal internet jitter; 500ms covers Starlink handoffs
-            # and other lossy/slow links.
+            # 300ms absorbs normal jitter; 500ms covers Starlink handoffs etc.
             max_delay = "500000" if (slow or lossy) else "300000"
 
-            if srt:
-                # SRT listener: server connects in as caller. Retransmission happens
-                # inside the latency window, so the stream that reaches the decoder
-                # is effectively lossless. SRT negotiates the higher of the two ends'
-                # latencies, so 500ms here pairs with the server's default of 500ms
-                # (bump the server's --srt-latency if this isn't enough for Starlink).
-                input_url = f"srt://0.0.0.0:{port}?mode=listener&latency=500000"
-            else:
-                # UDP: fifo_size is ffmpeg's ring buffer; buffer_size is the kernel
-                # socket buffer (default ~200KB on macOS) so bursts don't overflow.
-                input_url = f"udp://0.0.0.0:{port}?overrun_nonfatal=1&fifo_size=50000000&buffer_size=65536000"
-
-            # ffmpeg: read MPEG-TS from the wire → decode → scale → raw RGB24 on stdout
+            # ffmpeg reads MPEG-TS from stdin (the demuxer feeds it), decodes,
+            # scales, and writes raw RGB24 frames to stdout for the GUI to pick up.
             cmd = [
                 "ffmpeg",
                 "-loglevel", "error",
@@ -116,7 +100,8 @@ class StreamClient:
                 # "non-existing PPS 0 referenced" storm when joining mid-stream.
                 "-probesize", "5M",
                 "-analyzeduration", "2000000",
-                "-i", input_url,
+                "-f", "mpegts",
+                "-i", "pipe:0",
                 "-vf", f"scale={FRAME_W}:{FRAME_H}",
                 "-f", "rawvideo",
                 "-pix_fmt", "rgb24",
@@ -124,17 +109,19 @@ class StreamClient:
                 "pipe:1",
             ]
 
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None)
+            # Default buffering on both pipes: stdout's BufferedReader gives us a
+            # blocking read(FRAME_SIZE) for full frames, and the demuxer's explicit
+            # flush() after each TS write pushes bytes through stdin promptly.
+            self._proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            )
 
-            # Heartbeat has to go out AFTER the listener is bound — otherwise
-            # the server's SRT caller races ahead and hits "Input/output error"
-            # trying to connect to a port that isn't listening yet. SRT takes
-            # longer than UDP to bind, so give it a second.
-            if srt:
-                time.sleep(1.0)
-            if keepalive:
-                self._heartbeat = HeartbeatSender(host, HEARTBEAT_PORT, stats=stats)
-                self._heartbeat.start()
+            # Single-port mux: same UDP socket carries video and PING/PONG.
+            self._heartbeat = UdpDemuxer(
+                host, port, self._proc.stdin,
+                keepalive=keepalive, stats=stats,
+            )
+            self._heartbeat.start()
 
             self.on_status("Streaming...")
 
@@ -171,6 +158,12 @@ class StreamClient:
         with self._lock:
             proc, self._proc = self._proc, None
             heartbeat, self._heartbeat = self._heartbeat, None
+        # Stop the demuxer first so it doesn't try to write into a closing stdin.
+        if heartbeat:
+            try:
+                heartbeat.stop()
+            except Exception:
+                pass
         if proc:
             try:
                 proc.kill()
@@ -180,15 +173,12 @@ class StreamClient:
                 proc.wait(timeout=3)
             except Exception:
                 pass
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-        if heartbeat:
-            try:
-                heartbeat.stop()
-            except Exception:
-                pass
+            for stream in (proc.stdin, proc.stdout):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
 
 
 # ── Video display widget ─────────────────────────────────────────────────────
@@ -306,17 +296,6 @@ class DeviceDialog(QDialog):
         self.lossy_cb.setChecked(device.get("lossy", False) if device else False)
         layout.addWidget(self.lossy_cb)
 
-        self.srt_cb = QCheckBox("Use SRT (reliable transport)")
-        self.srt_cb.setToolTip(
-            "Transport over SRT instead of raw UDP. SRT retransmits lost\n"
-            "packets within a ~200ms latency budget — the stream reaching\n"
-            "the decoder is effectively lossless.\n\n"
-            "Server must also be started with --srt.\n"
-            "Requires ffmpeg built with libsrt on both ends."
-        )
-        self.srt_cb.setChecked(device.get("srt", False) if device else False)
-        layout.addWidget(self.srt_cb)
-
         self.stats_cb = QCheckBox("Show RTT stats")
         self.stats_cb.setChecked(device.get("stats", False) if device else False)
         layout.addWidget(self.stats_cb)
@@ -362,7 +341,6 @@ class DeviceDialog(QDialog):
             "keepalive": self.keepalive_cb.isChecked(),
             "slow": self.slow_cb.isChecked(),
             "lossy": self.lossy_cb.isChecked(),
-            "srt": self.srt_cb.isChecked(),
             "stats": self.stats_cb.isChecked(),
         }
         self.accept()
@@ -563,10 +541,6 @@ class MainWindow(QMainWindow):
             return
 
         dev = self._devices[row]
-        if dev.get("stats") and not dev.get("keepalive"):
-            QMessageBox.warning(self, "Error", "RTT stats require keepalive. Edit the device settings.")
-            return
-
         self._active_device = dev
         self._right_title.setText(dev["name"])
         self._right_status.setText("Connecting...")
@@ -576,9 +550,9 @@ class MainWindow(QMainWindow):
 
         self._client.start(dev["host"], dev["port"], dev.get("slow", False),
                            dev.get("keepalive", True), dev.get("stats", False),
-                           dev.get("lossy", False), dev.get("srt", False))
+                           dev.get("lossy", False))
 
-        if dev.get("stats") and dev.get("keepalive"):
+        if dev.get("stats"):
             self._stats_timer.start(2000)
 
     def _disconnect(self):
@@ -606,7 +580,14 @@ class MainWindow(QMainWindow):
         if not hb:
             return
         with hb._lock:
-            if hb.rtt_last is not None:
+            if hb.rtt_last is None:
+                # Stats enabled but no PONG yet — show a placeholder so the user
+                # can tell stats are armed and the return path is what's missing.
+                self._video.set_stats(
+                    "RTT:  — ms (waiting for PONG)\n"
+                    "Pings: 0"
+                )
+            else:
                 avg = hb._rtt_sum / hb._rtt_count if hb._rtt_count else 0
                 self._video.set_stats(
                     f"RTT:  {hb.rtt_last:.0f} ms\n"

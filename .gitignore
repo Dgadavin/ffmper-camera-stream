@@ -3,3 +3,4 @@ CLAUDE.md
 *.mp4
 __pycache__/
 client/devices.json
+local-setup/
